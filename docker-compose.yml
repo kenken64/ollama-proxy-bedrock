@@ -1,0 +1,19 @@
+services:
+  ollama-proxy:
+    build: .
+    container_name: ollama-proxy-bedrock
+    ports:
+      - "11434:11434"
+    environment:
+      # Override these for your environment (defaults are baked in for UAT)
+      GATEWAY_URL: ${GATEWAY_URL:-https://gnfyayl5ib.execute-api.ap-southeast-1.amazonaws.com/UAT/}
+      GATEWAY_API_KEY: ${GATEWAY_API_KEY:-ydmoI59i8c4NyRnY8IHDe1JEdjoAscD28RzUmJYr}
+      DEFAULT_MODEL: ${DEFAULT_MODEL:-sonnet4.5}
+      MAX_TOKENS: ${MAX_TOKENS:-256}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:11434/',timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
