@@ -3,24 +3,27 @@
 
 Sends a chat request directly to the base URL (no /api/chat suffix).
 
-Request schema (discovered by probing the endpoint):
+Request schema (gateway contract):
     POST <BASE_URL>
     Headers: X-API-Key, Content-Type: application/json
     Body: {
-        "modelId": "<bedrock model id>",
+        "modelId": "<bedrock model id or inference profile>",
+        "system": [{"text": "You are a helpful assistant."}],      # optional
         "messages": [{"role": "user", "content": [{"text": "..."}]}],
-        "inferenceConfig": {"maxTokens": 100}   # caps the quota reservation
+        "inferenceConfig": {"temperature": 0.5, "maxTokens": 200}
     }
 
 Notes (from live probing):
     - The gateway reserves 1024 tokens per request by default; pass
       inferenceConfig.maxTokens to lower the reservation to fit quota.
-    - anthropic.claude-3-sonnet-20240229-v1:0 requires an inference profile;
-      use anthropic.claude-3-haiku-20240307-v1:0 or the apac.* profile IDs.
+    - Base Claude model IDs reject on-demand invocation; use inference
+      profile IDs (e.g. global.anthropic.claude-sonnet-4-5-20250929-v1:0).
 
 Usage:
     python3 test_client.py "Your message here"
-    python3 test_client.py --model anthropic.claude-3-haiku-20240307-v1:0 --max-tokens 100 "Hello"
+    python3 test_client.py --system "You are a helpful assistant." \
+        --temperature 0.5 --max-tokens 200 "Explain AWS Lambda in one sentence."
+    python3 test_client.py --payload request.json   # send a raw JSON file as-is
 """
 
 import argparse
@@ -34,8 +37,9 @@ API_KEY = "ydmoI59i8c4NyRnY8IHDe1JEdjoAscD28RzUmJYr"
 DEFAULT_MODEL = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 
-def send_chat(message: str, model_id: str = DEFAULT_MODEL,
-              max_tokens: int = 256, timeout: int = 120) -> dict:
+def build_payload(message: str, model_id: str, max_tokens: int,
+                  temperature: float | None, system: str | None) -> dict:
+    """Build the exact gateway request payload."""
     payload = {
         "modelId": model_id,
         "messages": [
@@ -43,6 +47,14 @@ def send_chat(message: str, model_id: str = DEFAULT_MODEL,
         ],
         "inferenceConfig": {"maxTokens": max_tokens},
     }
+    if system:
+        payload["system"] = [{"text": system}]
+    if temperature is not None:
+        payload["inferenceConfig"]["temperature"] = temperature
+    return payload
+
+
+def send_payload(payload: dict, timeout: int = 120) -> dict:
     req = urllib.request.Request(
         BASE_URL,
         data=json.dumps(payload).encode("utf-8"),
@@ -66,22 +78,44 @@ def send_chat(message: str, model_id: str = DEFAULT_MODEL,
         return {"status": None, "body": {"error": str(e.reason)}}
 
 
+def send_chat(message: str, model_id: str = DEFAULT_MODEL,
+              max_tokens: int = 256, temperature: float | None = None,
+              system: str | None = None, timeout: int = 120) -> dict:
+    return send_payload(
+        build_payload(message, model_id, max_tokens, temperature, system),
+        timeout,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Test client for the UAT Bedrock chat proxy")
     parser.add_argument("message", nargs="?", default="Say hello in one word.",
                         help="User message to send")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Bedrock model ID")
+    parser.add_argument("--system", default=None,
+                        help="System prompt (sent as system: [{text: ...}])")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="inferenceConfig.temperature (0.0 - 1.0)")
     parser.add_argument("--max-tokens", type=int, default=256,
-                        help="Max output tokens (also sets the quota reservation)")
+                        help="inferenceConfig.maxTokens (also sets the quota reservation)")
+    parser.add_argument("--payload", default=None,
+                        help="Path to a JSON file to send verbatim as the request body")
     parser.add_argument("--timeout", type=int, default=120, help="Request timeout (seconds)")
     args = parser.parse_args()
 
+    if args.payload:
+        with open(args.payload, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    else:
+        payload = build_payload(args.message, args.model, args.max_tokens,
+                                args.temperature, args.system)
+
     print(f"POST {BASE_URL}")
-    print(f"modelId: {args.model}")
-    print(f"message: {args.message}")
+    print("Request payload:")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
     print("-" * 60)
 
-    result = send_chat(args.message, args.model, args.max_tokens, args.timeout)
+    result = send_payload(payload, args.timeout)
 
     print(f"HTTP status: {result['status']}")
     print(json.dumps(result["body"], indent=2, ensure_ascii=False))

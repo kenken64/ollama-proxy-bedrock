@@ -58,6 +58,12 @@ PROXY_HOST = os.environ.get("PROXY_HOST", "127.0.0.1")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "11434"))
 DEFAULT_MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "256"))
 
+# Auto-continue: when the client's requested num_predict exceeds the gateway's
+# per-call maxTokens clamp (1024), chain multiple calls ("continue") until the
+# target is reached or the model stops on its own.
+GATEWAY_MAX_TOKENS = int(os.environ.get("GATEWAY_MAX_TOKENS", "1024"))
+MAX_CONTINUE_ROUNDS = int(os.environ.get("MAX_CONTINUE_ROUNDS", "16"))
+
 # Short names (what Ollama clients ask for) -> gateway/Bedrock model IDs.
 # NOTE: only inference-profile IDs that the gateway account can actually
 # invoke belong here; verified working ones are marked.
@@ -197,6 +203,99 @@ def call_gateway(model_id: str, messages, max_tokens: int, system_parts=None,
         "text": text,
         "usage": body.get("usage", {}),
         "latency_ms": latency_ms,
+    }
+
+
+CONTINUE_PROMPT = (
+    "Continue exactly from where you stopped. Do not repeat, summarize, "
+    "or conclude yet — keep writing the next section in the same style."
+)
+
+
+# Sliding-window size (characters) of already-generated text sent back to the
+# model as continuation context. The API Gateway rejects bodies > ~6 KB with
+# 403 Forbidden, so we must NOT grow the conversation with full text each round.
+CONTINUE_CONTEXT_CHARS = int(os.environ.get("CONTINUE_CONTEXT_CHARS", "1200"))
+
+
+def call_gateway_long(model_id: str, messages, max_tokens: int,
+                      system_parts=None, api_key: str | None = None) -> dict:
+    """Call the gateway, automatically chaining 'continue' rounds when the
+    requested max_tokens exceeds the gateway's per-call clamp
+    (GATEWAY_MAX_TOKENS) and the model stopped because it hit that ceiling.
+
+    Sliding window: each continuation round sends only the ORIGINAL messages
+    plus the last CONTINUE_CONTEXT_CHARS characters of generated text (not the
+    full transcript), keeping every request small enough to pass the gateway's
+    body-size limit regardless of how many rounds we chain.
+
+    Returns the same shape as call_gateway, with:
+      - text: concatenation of all rounds
+      - usage: summed input/output tokens across rounds
+      - rounds: number of gateway calls made
+      - truncated: True if we stopped because of MAX_CONTINUE_ROUNDS
+    """
+    per_call = min(max_tokens, GATEWAY_MAX_TOKENS)
+    original_messages = list(messages)
+    all_text = []
+    total_in = 0
+    total_out = 0
+    rounds = 0
+    truncated = False
+
+    for _ in range(MAX_CONTINUE_ROUNDS):
+        if rounds == 0:
+            convo = original_messages
+            sys_parts = system_parts
+        else:
+            # Sliding window: original prompt + tail of what we have so far
+            generated = "".join(all_text)
+            tail = generated[-CONTINUE_CONTEXT_CHARS:]
+            convo = original_messages + [
+                {"role": "assistant", "content": [{"text": tail}]},
+                {"role": "user", "content": [{"text": CONTINUE_PROMPT}]},
+            ]
+            sys_parts = None
+
+        result = call_gateway(model_id, convo, per_call,
+                              sys_parts, api_key=api_key)
+        if not result["ok"]:
+            # If we already have partial output, return it instead of failing
+            if all_text:
+                truncated = True
+                break
+            return result
+
+        rounds += 1
+        chunk = result["text"] or ""
+        all_text.append(chunk)
+        usage = result["usage"]
+        total_in += usage.get("inputTokens", 0)
+        total_out += usage.get("outputTokens", 0)
+
+        stop_reason = (result["gateway_body"] or {}).get("stopReason")
+
+        # Reached the requested target -> done
+        if total_out >= max_tokens:
+            break
+
+        # Model says it finished naturally. Trust it only if we have produced
+        # at least ~80% of the target — otherwise treat it as an early wrap-up
+        # and keep going (models often conclude a "continue" turn early).
+        if stop_reason != "max_tokens" and total_out >= int(max_tokens * 0.8):
+            break
+    else:
+        truncated = True
+
+    return {
+        "ok": True,
+        "status": 200,
+        "error": None,
+        "gateway_body": None,
+        "text": "".join(all_text),
+        "usage": {"inputTokens": total_in, "outputTokens": total_out},
+        "rounds": rounds,
+        "truncated": truncated,
     }
 
 
@@ -366,8 +465,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         )
 
         messages, system_parts = ollama_messages_to_bedrock(body.get("messages"))
-        result = call_gateway(model_id, messages, max_tokens, system_parts,
-                              api_key=api_key)
+
+        if max_tokens > GATEWAY_MAX_TOKENS:
+            # Auto-continue: chain multiple gateway calls to reach the target
+            result = call_gateway_long(model_id, messages, max_tokens,
+                                       system_parts, api_key=api_key)
+        else:
+            result = call_gateway(model_id, messages, max_tokens, system_parts,
+                                  api_key=api_key)
 
         if not result["ok"]:
             status = result["status"] or 502
@@ -424,8 +529,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         messages = [{"role": "user", "content": [{"text": prompt}]}]
         system_parts = [body["system"]] if body.get("system") else []
-        result = call_gateway(resolve_model(model_name), messages, max_tokens,
-                              system_parts, api_key=api_key)
+        if max_tokens > GATEWAY_MAX_TOKENS:
+            result = call_gateway_long(resolve_model(model_name), messages,
+                                       max_tokens, system_parts, api_key=api_key)
+        else:
+            result = call_gateway(resolve_model(model_name), messages,
+                                  max_tokens, system_parts, api_key=api_key)
 
         if not result["ok"]:
             status = result["status"] or 502
