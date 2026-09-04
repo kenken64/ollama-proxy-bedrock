@@ -113,31 +113,120 @@ def resolve_model(name: str) -> str:
     return MODELS.get(name, name)  # pass through unknown names verbatim
 
 
+def ollama_tools_to_bedrock(tools):
+    """Convert Ollama/OpenAI-style tools -> Bedrock Converse toolConfig.
+
+    Ollama:  {"type": "function", "function": {"name", "description", "parameters"}}
+    Bedrock: {"toolSpec": {"name", "description", "inputSchema": {"json": ...}}}
+    Non-function entries are dropped."""
+    specs = []
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if t.get("type") == "function" else t
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not name:
+            continue
+        spec = {"name": name}
+        if fn.get("description"):
+            spec["description"] = fn["description"]
+        spec["inputSchema"] = {"json": fn.get("parameters") or {"type": "object"}}
+        specs.append({"toolSpec": spec})
+    return {"tools": specs} if specs else None
+
+
 def ollama_messages_to_bedrock(messages):
-    """Convert Ollama chat messages -> gateway message schema."""
+    """Convert Ollama chat messages -> gateway message schema.
+
+    Handles tool calling:
+      - assistant messages with tool_calls -> assistant content with toolUse blocks
+      - role:"tool" messages -> user content with toolResult blocks
+
+    Bedrock requires toolResult.toolUseId to match the toolUse.toolUseId from
+    the preceding assistant message. Ollama tool messages carry no ID, so IDs
+    are synthesized deterministically as "<name>_<k>" (k-th call of that tool
+    in the conversation) and consumed FIFO — the assistant toolUse and the
+    client tool result therefore pair up consistently within this request.
+    """
     out = []
     system_parts = []
+    pending_tool_ids = []  # synthesized toolUseIds awaiting results, FIFO
+    name_counters = {}     # per-tool-name call index
+    tool_result_buffer = []
+
+    def flush_buffer():
+        nonlocal tool_result_buffer
+        if tool_result_buffer:
+            content = []
+            for result_text in tool_result_buffer:
+                tool_use_id = (
+                    pending_tool_ids.pop(0) if pending_tool_ids else "call_unknown"
+                )
+                content.append({
+                    "toolResult": {
+                        "toolUseId": tool_use_id,
+                        "content": [{"text": str(result_text)}],
+                    }
+                })
+            out.append({"role": "user", "content": content})
+            tool_result_buffer = []
+
     for m in messages or []:
         role = m.get("role", "user")
         content = m.get("content", "")
         if role == "system":
+            flush_buffer()
             system_parts.append(content)
             continue
-        if role not in ("user", "assistant"):
-            role = "user"
-        out.append({"role": role, "content": [{"text": content}]})
+        if role == "tool":
+            # Ollama tool result message; buffer so consecutive tool results
+            # merge into ONE user message (Bedrock requirement)
+            tool_result_buffer.append(content)
+            continue
+
+        flush_buffer()
+
+        if role == "assistant":
+            blocks = []
+            if content:
+                blocks.append({"text": content})
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                name_counters[name] = name_counters.get(name, 0) + 1
+                tool_use_id = f"{name}_{name_counters[name]}"
+                pending_tool_ids.append(tool_use_id)
+                blocks.append({
+                    "toolUse": {
+                        "toolUseId": tool_use_id,
+                        "name": name,
+                        "input": fn.get("arguments") or {},
+                    }
+                })
+            if blocks:
+                out.append({"role": "assistant", "content": blocks})
+            continue
+
+        out.append({"role": "user", "content": [{"text": content}]})
+
+    flush_buffer()
+
     if not out:
         out.append({"role": "user", "content": [{"text": ""}]})
     return out, system_parts
 
 
 def call_gateway(model_id: str, messages, max_tokens: int, system_parts=None,
-                 api_key: str | None = None) -> dict:
+                 api_key: str | None = None, tool_config=None) -> dict:
     """Forward a chat request to the AWS API Gateway. Returns dict with
-    keys: ok, status, gateway_body, error (str|None), text, usage, latency_ms.
+    keys: ok, status, gateway_body, error (str|None), text, tool_calls,
+    stop_reason, usage, latency_ms.
 
     api_key: per-request gateway key supplied by the client; falls back to
-    GATEWAY_API_KEY when not provided."""
+    GATEWAY_API_KEY when not provided.
+    tool_config: Bedrock Converse toolConfig dict (from ollama_tools_to_bedrock)."""
     payload = {
         "modelId": model_id,
         "messages": messages,
@@ -145,6 +234,8 @@ def call_gateway(model_id: str, messages, max_tokens: int, system_parts=None,
     }
     if system_parts:
         payload["system"] = [{"text": "\n".join(system_parts)}]
+    if tool_config:
+        payload["toolConfig"] = tool_config
 
     req = urllib.request.Request(
         GATEWAY_URL,
@@ -189,18 +280,34 @@ def call_gateway(model_id: str, messages, max_tokens: int, system_parts=None,
             "latency_ms": latency_ms,
         }
 
-    text = ""
+    # Parse ALL content blocks: text + toolUse (order preserved)
+    text_parts = []
+    tool_calls = []
     output = body.get("output") if isinstance(body, dict) else None
     message = output.get("message") if isinstance(output, dict) else None
     content = message.get("content") if isinstance(message, dict) else None
-    if isinstance(content, list) and content and isinstance(content[0], dict):
-        text = content[0].get("text", "")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if "text" in block:
+                text_parts.append(block["text"])
+            elif "toolUse" in block and isinstance(block["toolUse"], dict):
+                tu = block["toolUse"]
+                tool_calls.append({
+                    "function": {
+                        "name": tu.get("name", ""),
+                        "arguments": tu.get("input") or {},
+                    }
+                })
     return {
         "ok": True,
         "status": status,
         "error": None,
         "gateway_body": body,
-        "text": text,
+        "text": "".join(text_parts),
+        "tool_calls": tool_calls,
+        "stop_reason": body.get("stopReason") if isinstance(body, dict) else None,
         "usage": body.get("usage", {}),
         "latency_ms": latency_ms,
     }
@@ -299,18 +406,22 @@ def call_gateway_long(model_id: str, messages, max_tokens: int,
     }
 
 
-def chat_response(model_name: str, text: str, usage: dict, done: bool = True) -> dict:
+def chat_response(model_name: str, text: str, usage: dict, done: bool = True,
+                  tool_calls=None, done_reason: str = "stop") -> dict:
     """Build an Ollama /api/chat response object."""
+    message = {"role": "assistant", "content": text}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     resp = {
         "model": model_name,
         "created_at": now_iso(),
-        "message": {"role": "assistant", "content": text},
+        "message": message,
         "done": done,
     }
     if done:
         resp.update(
             {
-                "done_reason": "stop",
+                "done_reason": done_reason,
                 "total_duration": 0,
                 "prompt_eval_count": usage.get("inputTokens", 0),
                 "eval_count": usage.get("outputTokens", 0),
@@ -465,14 +576,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         )
 
         messages, system_parts = ollama_messages_to_bedrock(body.get("messages"))
+        tool_config = ollama_tools_to_bedrock(body.get("tools"))
 
-        if max_tokens > GATEWAY_MAX_TOKENS:
+        if max_tokens > GATEWAY_MAX_TOKENS and not tool_config:
             # Auto-continue: chain multiple gateway calls to reach the target
+            # (text-only; tool calls are returned immediately instead)
             result = call_gateway_long(model_id, messages, max_tokens,
                                        system_parts, api_key=api_key)
         else:
             result = call_gateway(model_id, messages, max_tokens, system_parts,
-                                  api_key=api_key)
+                                  api_key=api_key, tool_config=tool_config)
 
         if not result["ok"]:
             status = result["status"] or 502
@@ -491,6 +604,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         usage = result["usage"]
         text = result["text"]
+        tool_calls = result.get("tool_calls") or None
+        done_reason = "stop"
+        if tool_calls or result.get("stop_reason") == "tool_use":
+            done_reason = "tool_calls"
 
         if stream:
             self.send_response(200)
@@ -505,14 +622,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"\r\n")
                 self.wfile.flush()
 
-            # Single content chunk then the final "done" chunk, Ollama-style.
+            # Ollama convention: text in content chunk(s); tool_calls arrive in
+            # the final done chunk.
             if text:
                 send_chunk(chat_response(model_name, text, {}, done=False))
-            send_chunk(chat_response(model_name, "", usage, done=True))
+            send_chunk(chat_response(model_name, "", usage, done=True,
+                                     tool_calls=tool_calls,
+                                     done_reason=done_reason))
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         else:
-            resp = chat_response(model_name, text, usage, done=True)
+            resp = chat_response(model_name, text, usage, done=True,
+                                 tool_calls=tool_calls, done_reason=done_reason)
             self._send_json(resp)
 
     def _handle_generate(self):

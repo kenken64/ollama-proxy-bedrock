@@ -113,6 +113,76 @@ value.
 | `role: "system"` messages | `system = [{"text": ...}]` (Bedrock Converse style) |
 | `options.num_predict` | `inferenceConfig.maxTokens` (**also sets the quota reservation**) |
 | `stream: true/false` | Controls NDJSON streaming vs single JSON response |
+| `tools` (function schemas) | `toolConfig.tools[]` with `toolSpec` (see [Tool calling](#tool-calling)) |
+| `role: "tool"` messages | `user` message with `toolResult` content blocks |
+| assistant `tool_calls` | assistant `toolUse` content blocks |
+
+### Tool calling
+
+`/api/chat` supports Ollama v0.5 tool calling end-to-end (the gateway Lambda
+passes `toolConfig` through to `bedrock.converse()`):
+
+**Request** — standard Ollama/OpenAI tool schema:
+
+```json
+{
+  "model": "sonnet4.5",
+  "messages": [{"role": "user", "content": "Weather in Singapore?"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }
+  }],
+  "stream": false
+}
+```
+
+**Response** — model's tool call in Ollama format (`done_reason: "tool_calls"`):
+
+```json
+{
+  "message": {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "Singapore"}}}]
+  },
+  "done": true,
+  "done_reason": "tool_calls"
+}
+```
+
+**Round-trip** — send the result back as `role: "tool"`, get the final answer:
+
+```json
+{
+  "messages": [
+    {"role": "user", "content": "Weather in Singapore?"},
+    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "get_weather", "arguments": {"city": "Singapore"}}}]},
+    {"role": "tool", "content": "{\"temp\": 31, \"condition\": \"sunny\"}"}
+  ],
+  "tools": [ ...same tools... ]
+}
+→ {"message": {"content": "The current weather in Singapore is sunny with a temperature of 31°C..."}}
+```
+
+Notes:
+- The proxy **returns tool calls to the client — it does not execute them**
+  (standard Ollama behavior; the client executes and re-sends the result).
+- Bedrock requires `toolResult.toolUseId` to match the assistant's
+  `toolUse.toolUseId`; Ollama messages carry no IDs, so the proxy synthesizes
+  them deterministically (`<tool-name>_<n>`, FIFO) within each request —
+  consecutive `role: "tool"` messages are merged into one Bedrock user
+  message as required by the Converse API.
+- Streaming: tool calls arrive in the final `done` chunk (Ollama convention).
+- When tools are provided, auto-continue is disabled — a `tool_use` stop
+  returns immediately so the client can execute the tool.
 
 ### Response format
 
@@ -395,14 +465,21 @@ Flags: `--model` (default: Sonnet 4.5 global profile), `--system`,
 | Auto-continue: 10000-word essay | ✅ 14 rounds, 14336 tokens, 5m41s |
 | Sliding window vs ~6 KB body limit | ✅ requests stay ~1.6 KB |
 | Early wrap-up guard (80% threshold) | ✅ prevents premature end_turn |
+| Tool call emitted (`tool_calls`) | ✅ get_weather + calculate |
+| Tool result round-trip | ✅ model used the returned weather data |
+| Tools present but not needed | ✅ plain text answer, no tool_calls |
+| Plain chat regression (no tools field) | ✅ unchanged behavior |
 
 ## Known limitations
 
 - **No true token streaming** — the gateway buffers, so the proxy emits the
   full reply as one chunk (format is still correct NDJSON).
-- **No tool calling / images / embeddings** — the gateway schema only supports
-  text messages; clients sending `tools` or image content will have those
-  fields ignored.
+- **No image / embedding support** — the gateway schema only supports text
+  (and tool-use) content blocks; image content is ignored.
+- **Tools are returned, not executed** — clients must run tool calls and
+  re-send results (standard Ollama behavior). Tool `toolUseId`s are
+  synthesized per-request, so tool results must be sent in the same order
+  the calls were returned.
 - **Long generations are slow** — auto-continue chains sequential 1024-token
   calls (~25s each); a 10k-word essay takes ~6 minutes. Client HTTP timeouts
   must accommodate this.
